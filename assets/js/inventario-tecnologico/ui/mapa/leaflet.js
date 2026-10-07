@@ -1,0 +1,275 @@
+// Leaflet (vía unpkg, sin API key) y todo lo visual que depende de él:
+// capas base, íconos de ubicación, indicadores de servidores agrupados y
+// estilos de las líneas (backbone, P2MP, respaldos y simulación).
+//
+// Leaflet se carga al abrir la pestaña Mapa por primera vez, no en
+// index.html: si unpkg.com está bloqueado o lento (firewall, proxy), el
+// resto de la app no se entera ni espera.
+// Versión fijada con SRI: los hashes son los del paquete npm leaflet@1.9.4,
+// el mismo archivo que sirve unpkg. Para actualizar Leaflet hay que cambiar
+// versión y hashes juntos (Leaflet 2.x cambió la API: no es un reemplazo directo).
+import { GROSOR_LINEAS, normalizarGrosor } from "../../nucleo/mapa-jerarquia.js";
+import { svgConTamano } from "../../nucleo/svg-seguro.js";
+import { desplazarPuntos } from "../../nucleo/lineas-agrupadas.js";
+import { MODO_TOOLTIP_POR_DEFECTO, normalizarModoTooltip } from "../../nucleo/tooltip-ubicacion.js";
+
+export const LEAFLET_VERSION = "1.9.4";
+export const LEAFLET_JS = {
+  url: `https://unpkg.com/leaflet@${LEAFLET_VERSION}/dist/leaflet.js`,
+  integrity: "sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=",
+};
+export const LEAFLET_CSS = {
+  url: `https://unpkg.com/leaflet@${LEAFLET_VERSION}/dist/leaflet.css`,
+  integrity: "sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=",
+};
+const ESPERA_MAXIMA_MS = 15000;
+
+let promesaLeaflet = null;
+
+function cargarRecurso(etiqueta, atributos){
+  return new Promise((resolve, reject)=>{
+    const el = document.createElement(etiqueta);
+    Object.entries(atributos).forEach(([k, v])=>el.setAttribute(k, v));
+    el.addEventListener("load", ()=>resolve());
+    el.addEventListener("error", ()=>{ el.remove(); reject(new Error(`No se pudo cargar ${atributos.src || atributos.href}`)); });
+    document.head.appendChild(el);
+  });
+}
+
+export function cargarLeaflet(){
+  if(window.L && typeof window.L.map === "function") return Promise.resolve(window.L);
+  if(!promesaLeaflet){
+    const descarga = Promise.all([
+      document.querySelector("link[data-inventario-tecnologico-leaflet]")
+        ? Promise.resolve()
+        : cargarRecurso("link", { rel: "stylesheet", href: LEAFLET_CSS.url, integrity: LEAFLET_CSS.integrity, crossorigin: "anonymous", "data-inventario-tecnologico-leaflet": "css" }),
+      cargarRecurso("script", { src: LEAFLET_JS.url, integrity: LEAFLET_JS.integrity, crossorigin: "anonymous" }),
+    ]);
+    const limite = new Promise((_, reject)=>setTimeout(()=>reject(new Error("unpkg.com no respondió a tiempo")), ESPERA_MAXIMA_MS));
+    promesaLeaflet = Promise.race([descarga, limite])
+      .then(()=>{
+        if(!window.L || typeof window.L.map !== "function") throw new Error("Leaflet se descargó pero no quedó disponible (window.L).");
+        return window.L;
+      })
+      .catch(err=>{ promesaLeaflet = null; throw err; }); // permite reintentar
+  }
+  return promesaLeaflet;
+}
+
+// ---------------------------------------------------------------------------
+// Capas base. Para que el mapa ABRA en satélite: CAPA_BASE_POR_DEFECTO = "satelite".
+// (El botón de capas arriba a la derecha permite cambiar en cualquier momento,
+// y el navegador recuerda la última elegida.)
+// El plano de lotes (ui/mapa/plano.js) ya no es una capa base: es una capa
+// superpuesta (casilla en el mismo botón) que va encima del mapa de
+// carreteras o del satélite, con su transparencia.
+// ---------------------------------------------------------------------------
+export const CAPAS_BASE = {
+  mapa: {
+    etiqueta: "Mapa",
+    url: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+    opciones: { maxZoom: 19, attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>' },
+  },
+  satelite: {
+    etiqueta: "Satélite",
+    url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+    opciones: { maxZoom: 19, attribution: "Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community" },
+  },
+};
+export const CAPA_BASE_POR_DEFECTO = "mapa";
+export const CENTRO_POR_DEFECTO = { lat: -2.1894, lng: -79.8891, zoom: 12 }; // Guayaquil, si aún no hay ubicaciones
+
+// Capas superpuestas (casillas del botón de capas).
+export const CAPAS_SUPERPUESTAS = {
+  plano: { etiqueta: "Plano de lotes" },
+  piscinas: { etiqueta: "Piscinas" },
+};
+
+const CLAVE_CAPA = "inventario-tecnologico-mapa-capa";
+const CLAVE_SUPERPUESTA = id=>`inventario-tecnologico-mapa-ver-${id}`;
+
+// Hasta la v6 el plano era la capa base "plano" (satélite + plano): quien la
+// tenía elegida sigue viéndolo igual, ahora como satélite + capa superpuesta.
+function capaGuardada(){
+  try{ return localStorage.getItem(CLAVE_CAPA); }catch(e){ return null; }
+}
+
+export function capaBaseInicial(){
+  const guardada = capaGuardada();
+  if(guardada === "plano") return "satelite";
+  if(guardada && CAPAS_BASE[guardada]) return guardada;
+  return CAPA_BASE_POR_DEFECTO;
+}
+
+export function recordarCapaBase(id){
+  try{ localStorage.setItem(CLAVE_CAPA, id); }catch(e){ /* sin almacenamiento: no pasa nada */ }
+}
+
+// ¿La capa superpuesta estaba encendida la última vez? (el plano también si
+// la base guardada era la antigua "plano").
+export function superpuestaInicial(id){
+  try{
+    const v = localStorage.getItem(CLAVE_SUPERPUESTA(id));
+    if(v === "1") return true;
+    if(v === "0") return false;
+  }catch(e){ /* almacenamiento bloqueado */ }
+  return id === "plano" && capaGuardada() === "plano";
+}
+
+export function recordarSuperpuesta(id, visible){
+  try{ localStorage.setItem(CLAVE_SUPERPUESTA(id), visible ? "1" : "0"); }catch(e){ /* sin almacenamiento: no pasa nada */ }
+}
+
+// Grosor de las líneas (v9): el factor que eligió cada quien en su navegador.
+const CLAVE_GROSOR = "inventario-tecnologico-mapa-grosor-lineas";
+export function grosorInicial(){
+  try{ const v = localStorage.getItem(CLAVE_GROSOR); return v === null ? GROSOR_LINEAS.porDefecto : normalizarGrosor(v); }catch(e){ return GROSOR_LINEAS.porDefecto; }
+}
+export function recordarGrosor(k){
+  try{ localStorage.setItem(CLAVE_GROSOR, String(normalizarGrosor(k))); }catch(e){ /* sin almacenamiento: no pasa nada */ }
+}
+
+// v15 (3.10): qué muestra el tooltip de una ubicación («Al pasar el mouse»).
+const CLAVE_TOOLTIP = "inventario-tecnologico-mapa-tooltip";
+export function modoTooltipInicial(){
+  try{ const v = localStorage.getItem(CLAVE_TOOLTIP); return v === null ? MODO_TOOLTIP_POR_DEFECTO : normalizarModoTooltip(v); }catch(e){ return MODO_TOOLTIP_POR_DEFECTO; }
+}
+export function recordarModoTooltip(modo){
+  try{ localStorage.setItem(CLAVE_TOOLTIP, normalizarModoTooltip(modo)); }catch(e){ /* sin almacenamiento: no pasa nada */ }
+}
+
+// v15 (3.9): la cobertura de los AP, a la vista o no (de fábrica, a la vista).
+const CLAVE_COBERTURA = "inventario-tecnologico-mapa-cobertura";
+export function coberturaInicial(){
+  try{ return localStorage.getItem(CLAVE_COBERTURA) !== "0"; }catch(e){ return true; }
+}
+export function recordarCobertura(visible){
+  try{ localStorage.setItem(CLAVE_COBERTURA, visible ? "1" : "0"); }catch(e){ /* sin almacenamiento: no pasa nada */ }
+}
+
+// v15 (3.9): la cobertura va en su propio pane: encima de las piscinas (380)
+// y debajo de las líneas (400) y de los pines.
+export const PANE_COBERTURA = "inventario-tecnologico-cobertura";
+export function crearPaneCobertura(mapa){
+  if(!mapa.getPane(PANE_COBERTURA)) mapa.createPane(PANE_COBERTURA).style.zIndex = "390";
+}
+export const COLOR_COBERTURA = "#007EB2";
+export const COLOR_COBERTURA_SIN_SERVICIO = "#8B9AAA";
+
+export function crearCapasBase(L){
+  const capas = {};
+  for(const [id, c] of Object.entries(CAPAS_BASE)) capas[id] = L.tileLayer(c.url, c.opciones);
+  return capas;
+}
+
+// ---------------------------------------------------------------------------
+// Íconos. Un solo divIcon (HTML + CSS en styles.css) con el color del tipo de
+// ubicación, un glifo para los tipos conocidos y un contador de equipos+activos.
+// ---------------------------------------------------------------------------
+const SVG = (cuerpo)=>`<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${cuerpo}</svg>`;
+
+export const GLIFOS_TIPO_UBICACION = {
+  torre: SVG(`<path d="M12 10.5 8.5 21M12 10.5 15.5 21M9.6 17.7h4.8"/><circle cx="12" cy="8.5" r="1.6" fill="currentColor" stroke="none"/><path d="M8.3 4.8a5.2 5.2 0 0 0 0 7.4M15.7 4.8a5.2 5.2 0 0 1 0 7.4"/>`),
+  oficina: SVG(`<rect x="5" y="3.5" width="14" height="17" rx="1.5"/><path d="M9 7.5h2M13 7.5h2M9 11h2M13 11h2M9 14.5h2M13 14.5h2M11 20.5v-2.5h2v2.5"/>`),
+  bodega: SVG(`<path d="M3.5 10 12 4.5 20.5 10v10h-17z"/><path d="M7.5 20v-6.5h9V20M7.5 16.8h9"/>`),
+};
+export const GLIFO_UBICACION_GENERICO = SVG(`<circle cx="12" cy="12" r="3.6" fill="currentColor" stroke="none"/>`);
+export const GLIFO_RADIO = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="12.5" width="16" height="7" rx="1.5"/><path d="M8 16h.01M11 16h.01"/><path d="M15.5 12.5 18 5"/><path d="M13.6 6.2a4 4 0 0 1 6.1 1.6"/></svg>`;
+
+export function glifoTipoUbicacion(tipo){
+  return GLIFOS_TIPO_UBICACION[tipo] || GLIFO_UBICACION_GENERICO;
+}
+
+// icono = el SVG del tipo de ubicación (v10, migración 012), ya limpio al
+// cargarlo; sin él, el glifo de fábrica.
+// v19 (3.21): tipoEquipo, si la bolita lleva el ícono de un tipo de equipo
+// (el único que dejan a la vista los filtros) en vez del de su ubicación.
+export function htmlPin({ color, tipo, icono = null, cantidad = 0, seleccionada = false, enlazada = false, archivada = false, atenuada = false, sinConexion = false, parcial = false, caida = false, tipoEquipo = null }){
+  const clases = ["inventario-tecnologico-mapa-pin"];
+  if(tipoEquipo) clases.push("inventario-tecnologico-mapa-pin-por-tipo");
+  if(seleccionada) clases.push("inventario-tecnologico-mapa-pin-seleccionada");
+  if(enlazada) clases.push("inventario-tecnologico-mapa-pin-enlazada");
+  if(archivada) clases.push("inventario-tecnologico-mapa-pin-archivada");
+  if(atenuada) clases.push("inventario-tecnologico-mapa-pin-atenuada");
+  if(sinConexion) clases.push("inventario-tecnologico-mapa-pin-sin-conexion");
+  else if(parcial) clases.push("inventario-tecnologico-mapa-pin-parcial");
+  if(caida) clases.push("inventario-tecnologico-mapa-pin-caida");
+  return `<div class="${clases.join(" ")}" style="--pin-color:${color}"${tipoEquipo ? ` data-tipo-equipo="${String(tipoEquipo).replace(/[^a-z0-9_-]/gi, "")}"` : ""}>`
+    + `<span class="inventario-tecnologico-mapa-pin-cuerpo"><span class="inventario-tecnologico-mapa-pin-glifo">${icono ? svgConTamano(icono, 15) : glifoTipoUbicacion(tipo)}</span></span>`
+    + (cantidad > 0 ? `<span class="inventario-tecnologico-mapa-pin-cantidad">${cantidad > 99 ? "99+" : cantidad}</span>` : "")
+    + (sinConexion || parcial ? `<span class="inventario-tecnologico-mapa-pin-alerta" aria-hidden="true">!</span>` : "")
+    + `</div>`;
+}
+
+// La punta del pin queda en (16, 36): ahí se ancla la coordenada.
+export function iconoUbicacion(L, opciones){
+  return L.divIcon({
+    className: "inventario-tecnologico-mapa-icono",
+    html: htmlPin(opciones),
+    iconSize: [32, 40],
+    iconAnchor: [16, 36],
+    tooltipAnchor: [0, -32],
+  });
+}
+
+// Indicador de un servidor con muchos clientes ("AP Cerro Azul · 23 clientes"),
+// debajo del pin de su ubicación. El ícono mide 0×0 en la coordenada y la
+// etiqueta se dibuja por CSS; "indice" apila varias de la misma ubicación.
+export function iconoAgrupado(L, { texto, detalle = "", expandido = false, alerta = false, indice = 0 }){
+  const clases = ["inventario-tecnologico-mapa-agrupado"];
+  if(expandido) clases.push("inventario-tecnologico-mapa-agrupado-expandido");
+  if(alerta) clases.push("inventario-tecnologico-mapa-agrupado-alerta");
+  return L.divIcon({
+    className: "inventario-tecnologico-mapa-icono-agrupado",
+    html: `<div class="${clases.join(" ")}" style="--fila:${indice}"><span class="inventario-tecnologico-mapa-agrupado-glifo">${expandido ? "▾" : "▸"}</span><span>${texto}</span>${detalle ? `<span class="inventario-tecnologico-mapa-agrupado-detalle">${detalle}</span>` : ""}</div>`,
+    iconSize: [0, 0],
+    iconAnchor: [0, 0],
+  });
+}
+
+// Estilos de línea (opciones de L.polyline). bubblingMouseEvents:false para
+// que el clic en una línea no llegue al mapa (que deselecciona). Cada estilo
+// lleva su clase CSS (mapa-linea-<estilo>) para las pruebas y la leyenda.
+const linea = (estilo, opciones)=>({ lineCap: "round", bubblingMouseEvents: false, className: `inventario-tecnologico-mapa-linea inventario-tecnologico-mapa-linea-${estilo}`, ...opciones });
+export const ESTILOS_LINEA = {
+  backbone:       linea("backbone",       { color: "#004DAB", weight: 5,   opacity: 0.9 }),
+  p2mp:           linea("p2mp",           { color: "#007EB2", weight: 2.2, opacity: 0.85 }),
+  // Cable o fibra entre dos ubicaciones (migración 008): línea continua, sin
+  // clase de radio.
+  cable:          linea("cable",          { color: "#3D4B59", weight: 3,   opacity: 0.9 }),
+  fibra:          linea("fibra",          { color: "#00A19A", weight: 3.5, opacity: 0.95 }),
+  cadena:         linea("cadena",         { color: "#EC741D", weight: 6,   opacity: 1 }),
+  cadenaRespaldo: linea("cadenaRespaldo", { color: "#1E8A5A", weight: 6,   opacity: 1, dashArray: "12 7" }),
+  cadenaRota:     linea("cadenaRota",     { color: "#B3432D", weight: 5,   opacity: 1, dashArray: "8 9" }),
+  cortado:        linea("cortado",        { color: "#B3432D", weight: 3,   opacity: 0.95, dashArray: "3 8" }),
+  sinConexion:    linea("sinConexion",    { color: "#8B9AAA", weight: 2.5, opacity: 0.9, dashArray: "6 7" }),
+  respaldo:       linea("respaldo",       { color: "#5B4B8A", weight: 2.4, opacity: 0.9, dashArray: "1 7" }),
+  recuperado:     linea("recuperado",     { color: "#1E8A5A", weight: 4,   opacity: 1, dashArray: "12 7" }),
+};
+// Borde blanco debajo de las líneas que tienen que resaltar sobre el mapa.
+export const ESTILOS_CON_HALO = new Set(["cadena", "cadenaRespaldo", "cadenaRota", "recuperado", "backbone", "cable", "fibra"]);
+export const HALO = { color: "#FFFFFF", opacity: 0.9, lineCap: "round", interactive: false };
+export const OPACIDAD_ATENUADA = 0.18;
+
+// v14 (3.8): una línea corrida unos píxeles hacia su costado, para las
+// franjas de un tramo con varias redes (y los tramos de clases distintas
+// entre las mismas dos ubicaciones). El corrimiento se aplica al proyectar
+// los puntos en la pantalla, así que vale en cualquier zoom sin recalcular
+// nada. Sin corrimiento es una L.polyline común.
+let LineaCorrida = null;
+export function lineaCorrida(L, puntos, opciones, desplazamiento = 0){
+  if(!desplazamiento) return L.polyline(puntos, opciones);
+  if(!LineaCorrida || LineaCorrida.leaflet !== L){
+    LineaCorrida = L.Polyline.extend({
+      _projectLatlngs(latlngs, result, projectedBounds){
+        const d = this.options.desplazamiento;
+        if(!d || !latlngs.length || !(latlngs[0] instanceof L.LatLng)) return L.Polyline.prototype._projectLatlngs.call(this, latlngs, result, projectedBounds);
+        const anillo = desplazarPuntos(latlngs.map(ll=>this._map.latLngToLayerPoint(ll)), d).map(p=>L.point(p.x, p.y));
+        for(const p of anillo) projectedBounds.extend(p);
+        result.push(anillo);
+      },
+    });
+    LineaCorrida.leaflet = L;
+  }
+  return new LineaCorrida(puntos, { ...opciones, desplazamiento });
+}
