@@ -1,11 +1,11 @@
-export const SUPABASE_URL = "https://tavyirvdfbetblprhtbo.supabase.co";
+export const SUPABASE_URL = "https://aregjgfzyezttknzvgmk.supabase.co";
 
-export const SUPABASE_KEY = "sb_publishable_-AXUgStuUjI8JENtt3BzUg_aDmlQPqX";
+export const SUPABASE_KEY = "sb_publishable_GTI0JdtWKY13Ylb-9gWSdA_Qk9GMBbP";
 
 if(!window.supabase){
   const root = document.getElementById("inventario-tecnologico-app");
   if(root) root.innerHTML = `<div class="inventario-tecnologico-login-wrap"><div class="inventario-tecnologico-login-card">
-    <div class="inventario-tecnologico-alert inventario-tecnologico-alert-error">No se pudo cargar la librería de Supabase desde cdn.jsdelivr.net.<br><br>Revisa tu conexión a internet, o si un bloqueador de anuncios / firewall está impidiendo la carga de ese dominio, y recarga la página.</div>
+    <div class="inventario-tecnologico-alert inventario-tecnologico-alert-error">No se pudo cargar la librería de Supabase desde cdn.jsdelivr.net.<br><br>Revisa tu conexión a internet, o si un bloqueador está impidiendo cargarla.</div>
   </div></div>`;
   throw new Error("supabase-js no se cargó (revisa la etiqueta <script> de cdn.jsdelivr.net en index.html)");
 }
